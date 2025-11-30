@@ -92,9 +92,9 @@ def reconstruct_path(parents: Dict[Any, Optional[Any]], target, source) -> List[
 random.seed(42)
 np.random.seed(42)
 
-N_NODES = 40
-P_EDGE = 0.10
-N_SERVERS = 8
+N_NODES = 20
+P_EDGE = 0.15  # Slightly higher probability to ensure connectivity with fewer nodes
+N_SERVERS = 5
 FILE_MB = 80.0
 
 G = nx.fast_gnp_random_graph(N_NODES, P_EDGE, seed=2)
@@ -102,10 +102,14 @@ if not nx.is_connected(G):
     comp = max(nx.connected_components(G), key=len)
     G = G.subgraph(comp).copy()
 
+# Convert to directed graph for asymmetric paths
+G = G.to_directed()
+
 nodes = list(G.nodes())
 client = nodes[0]
 servers = nodes[1:1+N_SERVERS]
 
+# Assign random weights to directed edges (u->v and v->u are independent)
 for u, v in G.edges():
     G.edges[u, v]['latency_ms'] = round(random.uniform(5.0, 250.0), 1)
     G.edges[u, v]['bandwidth_mbps'] = round(random.uniform(1.0, 300.0), 1)
@@ -113,8 +117,8 @@ for u, v in G.edges():
 # All servers have the same upload capacity (sufficient to serve the file)
 SERVER_CAPACITY_MBPS = FILE_MB * 8  # Capacity equals file bitrate
 
-# Use spring layout and scale it for better visibility
-pos = nx.spring_layout(G, seed=42)
+# Layout nodes - spread them out more
+pos = nx.spring_layout(G, seed=42, k=2.5, iterations=100)  # Increased k for more spread
 # Scale positions to fit nicely in view
 pos_array = np.array([pos[n] for n in nodes])
 pos_array = (pos_array - pos_array.mean(axis=0)) * 800  # Scale to 800 units
@@ -193,27 +197,34 @@ class NetworkVisualization:
             edge_pos.append(list(pos[v]) + [0])
         edge_pos = np.array(edge_pos, dtype=np.float32)
         
-        self.base_edges = visuals.Line(pos=edge_pos, color=(0.3, 0.3, 0.4, 0.15), 
-                                       width=0.5, connect='segments', parent=self.view.scene)
+        # Edge lines (base network) - make them thicker and more visible
+        edge_pos = []
+        for u, v in G.edges():
+            edge_pos.append(list(pos[u]) + [0])
+            edge_pos.append(list(pos[v]) + [0])
+        edge_pos = np.array(edge_pos, dtype=np.float32)
+        
+        self.base_edges = visuals.Line(pos=edge_pos, color=(0.5, 0.5, 0.6, 0.3), 
+                                       width=3, connect='segments', parent=self.view.scene)
         
         # Highlighted path edges (will be updated)
         self.path_edges = visuals.Line(pos=np.array([[0,0,0], [1,1,0]], dtype=np.float32),
-                                       color='red', width=6, connect='segments', 
+                                       color='#ff3333', width=12, connect='segments', 
                                        parent=self.view.scene)
         
-        # Node markers - make intermediate nodes VERY small
+        # Node markers - make intermediate nodes bigger
         node_positions = np.array([list(pos[n]) + [0] for n in nodes], dtype=np.float32)
-        node_colors = np.array([[0.5, 0.5, 0.6, 0.4] for _ in nodes], dtype=np.float32)
-        node_sizes = np.array([3 for _ in nodes], dtype=np.float32)  # Very small by default
+        node_colors = np.array([[0.5, 0.5, 0.6, 0.8] for _ in nodes], dtype=np.float32)
+        node_sizes = np.array([15 for _ in nodes], dtype=np.float32)  # Bigger intermediate nodes
         
         # Highlight client - large green circle
         node_colors[client] = [0.2, 1.0, 0.2, 1.0]  # Bright green for client
-        node_sizes[client] = 30
+        node_sizes[client] = 70
         
         # Highlight servers - large blue circles
         for s in servers:
             node_colors[s] = [0.3, 0.7, 1.0, 1.0]  # Bright blue for servers
-            node_sizes[s] = 25
+            node_sizes[s] = 70
         
         self.nodes = visuals.Markers(pos=node_positions, size=node_sizes,
                                      face_color=node_colors, edge_color='white',
@@ -235,13 +246,31 @@ class NetworkVisualization:
                            parent=self.view.scene, bold=True)
             self.text_items.append(t)
         
-        # Path edge labels (will be dynamically updated)
-        self.edge_label_texts = []
-        for i in range(20):  # Pre-create text objects for edge labels
-            t = visuals.Text('', pos=[0, 0, 0], 
-                           color='yellow', font_size=9, anchor_x='center', anchor_y='center',
-                           parent=self.view.scene)
-            self.edge_label_texts.append(t)
+        # Permanent edge labels for ALL edges
+        self.edge_labels = []
+        for u, v in G.edges():
+            lat = _get_edge_latency(G, u, v)
+            bw = _get_edge_bandwidth(G, u, v)
+            
+            # Position labels
+            mid_x = (pos[u][0] + pos[v][0]) / 2
+            mid_y = (pos[u][1] + pos[v][1]) / 2
+            
+            # Add small offset based on edge direction to separate u->v and v->u labels
+            # Simple heuristic: shift slightly perpendicular to the edge
+            dx = pos[v][0] - pos[u][0]
+            dy = pos[v][1] - pos[u][1]
+            length = np.sqrt(dx*dx + dy*dy)
+            if length > 0:
+                off_x = -dy / length * 15  # 15 units offset
+                off_y = dx / length * 15
+            else:
+                off_x, off_y = 0, 0
+            
+            t = visuals.Text(f'{int(lat)}ms\n{int(bw)}Mbps', pos=[mid_x + off_x, mid_y + off_y, 0], 
+                           color='white', font_size=8, anchor_x='center', anchor_y='center',
+                           parent=self.view.scene, bold=True)
+            self.edge_labels.append(t)
         
         # Path info box (bottom-left)
         self.path_info_text = visuals.Text('', 
@@ -291,8 +320,9 @@ class NetworkVisualization:
         info_lines = [
             f"📊 NETWORK INFO",
             f"━━━━━━━━━━━━━━━━",
+            f"Type: Directed Graph ➡️",
             f"Nodes: {len(nodes)}",
-            f"Edges: {len(G.edges())}",
+            f"Edges: {len(G.edges())} (Asymmetric)",
             f"Density: {len(G.edges())/(len(nodes)*(len(nodes)-1)/2)*100:.1f}%",
             f"File: {FILE_MB} MB = {FILE_MB*8:.0f} Mb",
             f"Servers: {N_SERVERS}",
@@ -312,9 +342,7 @@ class NetworkVisualization:
         
     def update_visuals(self):
         """Update visuals based on current frame"""
-        # Clear edge labels
-        for t in self.edge_label_texts:
-            t.text = ''
+        # Note: Edge labels are now permanent, so we don't clear them
         
         if self.current_frame < len(eval_order):
             # Evaluate current server
@@ -335,22 +363,19 @@ class NetworkVisualization:
                     u, v = path[i], path[i+1]
                     path_pos.append(list(pos[u]) + [0])
                     path_pos.append(list(pos[v]) + [0])
-                    
                     # Get edge info
                     lat = _get_edge_latency(G, u, v)
                     bw = _get_edge_bandwidth(G, u, v)
                     total_latency += lat
                     min_bandwidth = min(min_bandwidth, bw)
                     
-                    # Add edge label at midpoint if we have space
-                    if i < len(self.edge_label_texts):
-                        mid_x = (pos[u][0] + pos[v][0]) / 2
-                        mid_y = (pos[u][1] + pos[v][1]) / 2
-                        self.edge_label_texts[i].pos = [mid_x, mid_y, 0]
-                        self.edge_label_texts[i].text = f'{int(lat)}ms\n{int(bw)}Mbps'
+                    # Highlight edge label on path
+                    # We could make the text bigger/brighter for active path, 
+                    # but for now the red line is enough indication
+                    pass
                 
                 path_pos = np.array(path_pos, dtype=np.float32)
-                self.path_edges.set_data(pos=path_pos, color='red', width=6)
+                self.path_edges.set_data(pos=path_pos, color='red', width=8)
                 
                 # Update path info box
                 path_info_lines = [
